@@ -32,7 +32,10 @@ def load_data(ticker: str, years: int) -> pd.DataFrame:
     if raw.empty:
         st.error(f"No data returned for ticker '{ticker}'.")
         st.stop()
-    return raw["Close"].to_frame(name=ticker)
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    return close.rename(ticker).to_frame()
 
 
 prices  = load_data(ticker, lookback)
@@ -118,10 +121,9 @@ with tab3:
     from vol_forecasting.regime.detector import detect_regimes, regime_summary
     from vol_forecasting.report.plots import plot_regime_bands
 
-    base = (
-        vol_series.get("ewma")
-        or vol_series.get("garch")
-        or realized_vol
+    base = next(
+        (vol_series[k] for k in ("ewma", "garch") if k in vol_series),
+        realized_vol,
     )
     regime_res = detect_regimes(base.dropna())
 
