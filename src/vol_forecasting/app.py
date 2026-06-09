@@ -79,7 +79,7 @@ with tab1:
         vol_series, realized=realized_vol,
         title=f"{ticker} — Conditional Volatility (annualised)",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if vol_series:
         cols = st.columns(len(vol_series))
@@ -101,7 +101,7 @@ with tab2:
         r.forecasts, r.realized,
         title=f"Forecast Error — {horizon}d horizon ({ticker})",
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
     st.subheader("Evaluation Metrics")
     rows = [
@@ -115,7 +115,7 @@ with tab2:
         }
         for m in r.metrics
     ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 with tab3:
     from vol_forecasting.regime.detector import detect_regimes, regime_summary
@@ -131,7 +131,7 @@ with tab3:
         regime_res.vol_series, regime_res.labels,
         title=f"{ticker} — Volatility Regimes",
     )
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width="stretch")
 
     summary = regime_summary(regime_res)
     st.subheader("Regime Breakdown")

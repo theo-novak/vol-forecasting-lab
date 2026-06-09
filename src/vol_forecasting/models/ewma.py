@@ -17,7 +17,9 @@ class EWMAResult:
 def fit_ewma(returns: pd.Series, lam: float = 0.94,
              annualise: bool = True) -> EWMAResult:
     """RiskMetrics EWMA: var_t = λ·var_{t-1} + (1-λ)·r_t²."""
-    var = returns.ewm(alpha=1.0 - lam, adjust=False).var()
+    # Use the uncentered second moment (mean of squares), not the centered
+    # variance, which is the exact RiskMetrics recursion.
+    var = (returns ** 2).ewm(alpha=1.0 - lam, adjust=False).mean()
     vol = np.sqrt(var)
     if annualise:
         vol = vol * np.sqrt(_TRADING_DAYS)

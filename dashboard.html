@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Volatility Forecasting Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.css" />
+  <style>
+    html, body, #root { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.js"></script>
+  <script>
+stlite.mount(
+  {
+    requirements: ["plotly", "scipy"],
+    entrypoint: "streamlit_app.py",
+    files: {
+      "streamlit_app.py": `
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from scipy.signal import lfilter
+from scipy.optimize import minimize
+
+st.set_page_config(page_title="Volatility Forecasting", layout="wide", page_icon="📊")
+st.title("📊 Conditional Volatility Forecasting")
+st.caption("Synthetic daily returns · EWMA · GARCH(1,1) via MLE · Regime detection — runs in-browser via stlite (no server required)")
+
+_DAYS = 252
+
+# ── Synthetic return presets ───────────────────────────────────────────────────
+# Each preset is generated from a GARCH(1,1) process with known parameters
+# so the fitted model can recover sensible estimates.
+_PRESET_META = {
+    "Low Vol (VIX~15)":     dict(omega=2.2e-6, alpha=0.05, beta=0.93, mu=0.0003),
+    "Normal Market (VIX~22)": dict(omega=4.8e-6, alpha=0.08, beta=0.89, mu=0.0002),
+    "High Vol (VIX~32)":    dict(omega=1.1e-5, alpha=0.12, beta=0.83, mu=0.0001),
+    "Crisis Episode":       None,  # regime-switching schedule
+}
+
+@st.cache_data
+def make_returns(preset: str) -> tuple:
+    """Generate 1000 business-day synthetic returns (seed 42). Returns (dates_list, values_array)."""
+    rng = np.random.default_rng(42)
+    n = 1000
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    z = rng.standard_normal(n)
+
+    if preset == "Crisis Episode":
+        sigma_sched = np.ones(n) * 0.009
+        sigma_sched[440:510] = 0.038
+        sigma_sched[510:600] = 0.021
+        sigma_sched[600:720] = 0.013
+        r = z * sigma_sched + 0.0001
+    else:
+        p = _PRESET_META[preset]
+        omega, alpha, beta, mu = p["omega"], p["alpha"], p["beta"], p["mu"]
+        lr_var = omega / max(1.0 - alpha - beta, 1e-9)
+        r = np.zeros(n)
+        sigma2 = np.zeros(n)
+        sigma2[0] = lr_var
+        for t in range(n):
+            r[t] = mu + np.sqrt(max(sigma2[t], 1e-14)) * z[t]
+            if t < n - 1:
+                sigma2[t + 1] = omega + alpha * r[t] ** 2 + beta * sigma2[t]
+
+    return dates.tolist(), r.tolist()
+
+# ── Model functions ────────────────────────────────────────────────────────────
+
+def ewma_vol(r: np.ndarray, lam: float) -> np.ndarray:
+    s = pd.Series(r)
+    var = s.ewm(alpha=1.0 - lam, adjust=False).var().values
+    return np.sqrt(np.clip(var, 0, None) * _DAYS)
+
+def rolling_hist_vol(r: np.ndarray, window: int = 21) -> np.ndarray:
+    s = pd.Series(r)
+    return (s.rolling(window).std(ddof=1) * np.sqrt(_DAYS)).values
+
+@st.cache_data
+def fit_garch(returns_key: str, r_tuple: tuple) -> tuple:
+    """Fit GARCH(1,1) via MLE using vectorised lfilter. Returns (cond_vol_array, omega, alpha, beta)."""
+    r = np.array(r_tuple)
+    n = len(r)
+    init_var = float(np.var(r))
+
+    def neg_ll(params):
+        om, al, be = params
+        if om <= 1e-14 or al <= 0 or be <= 0 or al + be >= 0.9999:
+            return 1e10
+        eps2_lag = np.concatenate([[0.0], r[:-1] ** 2])
+        u = om + al * eps2_lag
+        u[0] = init_var
+        sigma2 = lfilter([1.0], [1.0, -be], u)
+        sigma2 = np.maximum(sigma2, 1e-14)
+        return 0.5 * float(np.sum(np.log(sigma2) + r ** 2 / sigma2))
+
+    x0 = [init_var * 0.06, 0.08, 0.88]
+    bounds = [(1e-12, init_var * 0.5), (1e-6, 0.45), (1e-6, 0.9985)]
+    res = minimize(neg_ll, x0, method="L-BFGS-B", bounds=bounds,
+                   options={"maxiter": 300, "ftol": 1e-10})
+    om, al, be = res.x
+
+    eps2_lag = np.concatenate([[0.0], r[:-1] ** 2])
+    u = om + al * eps2_lag
+    u[0] = init_var
+    sigma2 = lfilter([1.0], [1.0, -be], u)
+    sigma2 = np.maximum(sigma2, 1e-14)
+    cond_vol = np.sqrt(sigma2 * _DAYS)
+
+    return cond_vol.tolist(), float(om), float(al), float(be)
+
+def fwd_realized_vol(r: np.ndarray, horizon: int) -> np.ndarray:
+    """Forward h-day realized vol: rv[t] uses returns t+1 .. t+h."""
+    sq = r ** 2
+    s = pd.Series(sq)
+    fwd_sum = s[::-1].rolling(horizon).sum()[::-1].values
+    rv = np.sqrt(fwd_sum * _DAYS / horizon)
+    rv_shifted = np.empty_like(rv)
+    rv_shifted[:-horizon] = rv[horizon:]
+    rv_shifted[-horizon:] = np.nan
+    return rv_shifted
+
+def detect_regimes(vol: np.ndarray, calm_q: float = 0.25, stressed_q: float = 0.75):
+    v = vol[np.isfinite(vol)]
+    calm_cap = float(np.quantile(v, calm_q))
+    stressed_floor = float(np.quantile(v, stressed_q))
+    labels = np.where(vol <= calm_cap, "calm",
+              np.where(vol >= stressed_floor, "stressed", "normal"))
+    return labels, calm_cap, stressed_floor
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Scenario")
+    preset = st.selectbox("Market preset", list(_PRESET_META.keys()), index=1)
+
+    st.divider()
+    st.header("Models")
+    use_hist  = st.checkbox("Rolling Historical (21d)", value=True)
+    use_ewma  = st.checkbox("EWMA (RiskMetrics)", value=True)
+    lam       = st.slider("λ — EWMA decay", 0.85, 0.99, 0.94, step=0.01,
+                          disabled=not use_ewma)
+    use_garch = st.checkbox("GARCH(1,1)", value=True)
+    if use_garch:
+        st.caption("GARCH is cached after the first fit for each preset.")
+
+    st.divider()
+    st.header("Forecast")
+    horizon = st.selectbox("Horizon (trading days)", [1, 5, 10, 21], index=1)
+
+# ── Load / compute ─────────────────────────────────────────────────────────────
+dates_list, r_list = make_returns(preset)
+dates = pd.DatetimeIndex(dates_list)
+r = np.array(r_list)
+
+hist_v  = rolling_hist_vol(r) if use_hist  else None
+ewma_v  = ewma_vol(r, lam)   if use_ewma  else None
+
+garch_v = garch_om = garch_al = garch_be = None
+if use_garch:
+    with st.spinner("Fitting GARCH(1,1)…"):
+        _gv, garch_om, garch_al, garch_be = fit_garch(preset, tuple(r_list))
+    garch_v = np.array(_gv)
+    garch_v_series = pd.Series(garch_v, index=dates)
+
+rv_roll = rolling_hist_vol(r)           # realized vol reference for tab1
+rv_fwd  = fwd_realized_vol(r, horizon)  # forward h-day target for tab2
+
+# ── Model colors ──────────────────────────────────────────────────────────────
+_COL = {"Historical": "#636EFA", "EWMA": "#EF553B", "GARCH": "#00CC96"}
+
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(
+    ["📈 Conditional Volatility", "📉 Forecast Error", "🗺️ Regime Map"]
+)
+
+# ═══ Tab 1: Conditional Volatility ════════════════════════════════════════════
+with tab1:
+    fig = go.Figure()
+
+    if use_hist and hist_v is not None:
+        fig.add_trace(go.Scatter(x=dates, y=hist_v,
+            name="Historical (21d)", line=dict(color=_COL["Historical"], width=1.6)))
+    if use_ewma and ewma_v is not None:
+        fig.add_trace(go.Scatter(x=dates, y=ewma_v,
+            name=f"EWMA (λ={lam:.2f})", line=dict(color=_COL["EWMA"], width=1.8)))
+    if use_garch and garch_v is not None:
+        fig.add_trace(go.Scatter(x=dates, y=garch_v,
+            name="GARCH(1,1)", line=dict(color=_COL["GARCH"], width=1.8)))
+
+    # Dotted realized-vol reference
+    fig.add_trace(go.Scatter(x=dates, y=rv_roll,
+        name="Realized (21d roll)", opacity=0.65,
+        line=dict(color="#AB63FA", width=1.2, dash="dot")))
+
+    fig.update_layout(
+        title=f"Conditional Volatility — {preset}",
+        xaxis_title="Date", yaxis_title="Annualised Vol",
+        template="plotly_white", height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Metric cards — latest vol per active model
+    active = {}
+    if use_hist  and hist_v  is not None: active["Historical"] = hist_v
+    if use_ewma  and ewma_v  is not None: active["EWMA"]       = ewma_v
+    if use_garch and garch_v is not None: active["GARCH"]      = garch_v
+
+    if active:
+        cols = st.columns(len(active))
+        for col, (name, arr) in zip(cols, active.items()):
+            valid = arr[np.isfinite(arr)]
+            latest = float(valid[-1]) if len(valid) else float("nan")
+            col.metric(f"{name} Vol", f"{latest:.2%}")
+
+    if use_garch and garch_v is not None:
+        st.divider()
+        lr_var = garch_om / max(1.0 - garch_al - garch_be, 1e-9)
+        lr_vol = float(np.sqrt(lr_var * _DAYS))
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("α  (ARCH effect)", f"{garch_al:.4f}")
+        g2.metric("β  (GARCH effect)", f"{garch_be:.4f}")
+        g3.metric("Persistence  α+β", f"{garch_al + garch_be:.4f}")
+        g4.metric("Long-run Vol", f"{lr_vol:.2%}")
+
+# ═══ Tab 2: Forecast Error ════════════════════════════════════════════════════
+with tab2:
+    # Build h-step-ahead forecasts for each model
+    forecasts = {}
+    if use_hist and hist_v is not None:
+        s = pd.Series(hist_v, index=dates)
+        forecasts["Historical"] = s.shift(horizon).values
+    if use_ewma and ewma_v is not None:
+        s = pd.Series(ewma_v, index=dates)
+        forecasts["EWMA"] = s.shift(horizon).values
+    if use_garch and garch_v is not None:
+        # Analytical GARCH h-step mean-reversion: σ²_{t+h} = σ̄² + (α+β)^(h-1)·(σ²_t − σ̄²)
+        lr_var   = garch_om / max(1.0 - garch_al - garch_be, 1e-9)
+        daily_var = (garch_v / np.sqrt(_DAYS)) ** 2
+        if horizon <= 1:
+            fwd_var = daily_var
+        else:
+            fwd_var = lr_var + (garch_al + garch_be) ** (horizon - 1) * (daily_var - lr_var)
+        fwd_vol = np.sqrt(np.clip(fwd_var, 0, None) * _DAYS)
+        forecasts["GARCH"] = pd.Series(fwd_vol, index=dates).shift(horizon).values
+
+    # Error chart — 21-day smoothed absolute error
+    fig2 = go.Figure()
+    metrics_rows = []
+
+    for name, fc in forecasts.items():
+        err = np.abs(fc - rv_fwd)
+        smooth = pd.Series(err).rolling(21).mean().values
+        fig2.add_trace(go.Scatter(x=dates, y=smooth,
+            name=name, line=dict(color=_COL[name], width=1.8)))
+
+        # Metrics
+        mask = np.isfinite(fc) & np.isfinite(rv_fwd)
+        f_m, r_m = fc[mask], rv_fwd[mask]
+        if len(f_m) == 0:
+            continue
+        mse  = float(np.mean((f_m - r_m) ** 2))
+        mae  = float(np.mean(np.abs(f_m - r_m)))
+        pos  = (f_m > 0) & (r_m > 0)
+        qlike = float(np.mean(np.log(f_m[pos]) + r_m[pos] / f_m[pos])) if pos.sum() else float("nan")
+        if len(f_m) > 1:
+            dir_acc = float(np.mean(np.sign(np.diff(f_m)) == np.sign(np.diff(r_m))))
+        else:
+            dir_acc = float("nan")
+        metrics_rows.append({
+            "Model":      name,
+            "MSE":        f"{mse:.2e}",
+            "MAE":        f"{mae:.4f}",
+            "QLIKE":      f"{qlike:.4f}" if np.isfinite(qlike) else "—",
+            "Dir. Acc.":  f"{dir_acc:.2%}" if np.isfinite(dir_acc) else "—",
+            "N":          int(mask.sum()),
+        })
+
+    fig2.update_layout(
+        title=f"Forecast Error — {horizon}d horizon (21-day smoothed |error|)",
+        xaxis_title="Date", yaxis_title="Absolute Error (annualised)",
+        template="plotly_white", height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    if metrics_rows:
+        st.subheader("Evaluation Metrics")
+        st.dataframe(pd.DataFrame(metrics_rows), hide_index=True, use_container_width=True)
+
+# ═══ Tab 3: Regime Map ════════════════════════════════════════════════════════
+with tab3:
+    # Use EWMA → GARCH → Historical as base for regime classification
+    base_v = (ewma_v if use_ewma and ewma_v is not None
+              else garch_v if use_garch and garch_v is not None
+              else hist_v if use_hist and hist_v is not None
+              else None)
+
+    if base_v is None:
+        st.info("Enable at least one model in the sidebar to see the regime map.")
+    else:
+        base_name = ("EWMA" if use_ewma and ewma_v is not None
+                     else "GARCH" if use_garch and garch_v is not None
+                     else "Historical")
+
+        labels, calm_cap, stressed_floor = detect_regimes(base_v)
+
+        _FILL = {
+            "calm":     "rgba(52, 168, 83,  0.15)",
+            "normal":   "rgba(251, 188,  5,  0.10)",
+            "stressed": "rgba(234,  67, 53,  0.18)",
+        }
+
+        fig3 = go.Figure()
+
+        # Draw shaded regime bands
+        valid_idx = np.where(np.isfinite(base_v))[0]
+        if len(valid_idx):
+            start_i  = int(valid_idx[0])
+            current  = labels[start_i]
+            band_x0  = dates[start_i]
+            for i in valid_idx[1:]:
+                if labels[i] != current:
+                    fig3.add_vrect(x0=band_x0, x1=dates[i],
+                                   fillcolor=_FILL[current], layer="below", line_width=0)
+                    band_x0, current = dates[i], labels[i]
+            fig3.add_vrect(x0=band_x0, x1=dates[valid_idx[-1]],
+                           fillcolor=_FILL[current], layer="below", line_width=0)
+
+        # Vol series line
+        fig3.add_trace(go.Scatter(x=dates, y=base_v,
+            name=base_name, line=dict(color=_COL[base_name], width=1.6)))
+
+        # Threshold lines
+        fig3.add_hline(y=calm_cap, line=dict(color="rgba(52,168,83,0.6)", width=1, dash="dot"),
+                       annotation_text=f"Calm cap {calm_cap:.2%}", annotation_position="right")
+        fig3.add_hline(y=stressed_floor, line=dict(color="rgba(234,67,53,0.6)", width=1, dash="dot"),
+                       annotation_text=f"Stressed floor {stressed_floor:.2%}", annotation_position="right")
+
+        fig3.update_layout(
+            title=f"Volatility Regimes ({base_name}) — {preset}",
+            xaxis_title="Date", yaxis_title="Annualised Vol",
+            template="plotly_white", height=420,
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+        # Regime breakdown tiles
+        calm_d     = int(np.sum(labels == "calm"))
+        normal_d   = int(np.sum(labels == "normal"))
+        stressed_d = int(np.sum(labels == "stressed"))
+        total      = calm_d + normal_d + stressed_d
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("😌 Calm",     f"{calm_d} days",     f"{calm_d/total:.1%}" if total else "—")
+        c2.metric("📊 Normal",   f"{normal_d} days",   f"{normal_d/total:.1%}" if total else "—")
+        c3.metric("⚠️ Stressed", f"{stressed_d} days", f"{stressed_d/total:.1%}" if total else "—")
+
+        st.caption(
+            f"Calm ≤ {calm_cap:.2%}   |   Stressed ≥ {stressed_floor:.2%}   "
+            f"(Q25 / Q75 of full-sample {base_name} vol)"
+        )
+`
+    }
+  },
+  document.getElementById("root")
+);
+  </script>
+</body>
+</html>

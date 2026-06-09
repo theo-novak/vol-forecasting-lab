@@ -4,8 +4,6 @@ A reusable Python module that fits rolling historical volatility, EWMA (RiskMetr
 
 Built on Python 3.11+ using `pandas`, `numpy`, `arch`, `scipy`, `pydantic` v2, `plotly`, and `streamlit`; packaged with `hatchling` and tested with `pytest` against a deterministic 500-day synthetic fixture.
 
-![Streamlit dashboard](streamlit_dashboard.png)
-
 ---
 
 ## Project Layout
